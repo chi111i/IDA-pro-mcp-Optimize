@@ -8,17 +8,21 @@ import json
 import struct
 import threading
 import http.server
+import uuid
 from urllib.parse import urlparse
 from typing import (
     Any,
     Callable,
     get_type_hints,
+    get_origin,
+    get_args,
     TypedDict,
     Optional,
     Annotated,
     TypeVar,
     Generic,
     NotRequired,
+    Union,
     overload,
     Literal,
 )
@@ -28,6 +32,87 @@ class JSONRPCError(Exception):
         self.code = code
         self.message = message
         self.data = data
+
+def _unwrap_type(hint: Any) -> type:
+    """Extract the actual type from Annotated[T, ...] or Optional[T] wrappers."""
+    origin = get_origin(hint)
+
+    # Handle Annotated[T, "description"] -> T
+    if origin is Annotated:
+        args = get_args(hint)
+        if args:
+            return _unwrap_type(args[0])
+
+    # Handle Optional[T] (Union[T, None]) -> T
+    if origin is Union:
+        args = get_args(hint)
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            return _unwrap_type(non_none[0])
+
+    # Base type
+    if isinstance(hint, type):
+        return hint
+
+    # Fallback: return as-is (e.g. for complex generic types)
+    return hint
+
+
+def _is_optional(hint: Any) -> bool:
+    """Check if a type hint is Optional (Union[T, None] or T | None)."""
+    origin = get_origin(hint)
+    # Annotated[Optional[T], ...] -> unwrap Annotated first
+    if origin is Annotated:
+        args = get_args(hint)
+        if args:
+            return _is_optional(args[0])
+    if origin is Union:
+        return type(None) in get_args(hint)
+    return False
+
+
+def _convert_value(value: Any, expected_type: type, param_name: str) -> Any:
+    """Convert a value to the expected type, handling None for Optional params."""
+    actual_type = _unwrap_type(expected_type)
+
+    # Allow None for Optional parameters
+    if value is None:
+        if _is_optional(expected_type):
+            return None
+        raise JSONRPCError(-32602, f"Parameter '{param_name}' is required (got null)")
+
+    # bool is subclass of int in Python, so check bool first
+    if actual_type is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            if value.lower() in ("true", "1", "yes"):
+                return True
+            if value.lower() in ("false", "0", "no"):
+                return False
+        raise JSONRPCError(-32602, f"Invalid type for parameter '{param_name}': expected bool")
+
+    # int/float/str: try isinstance first, then convert
+    if actual_type in (int, float, str):
+        if isinstance(value, actual_type):
+            return value
+        try:
+            return actual_type(value)
+        except (ValueError, TypeError):
+            raise JSONRPCError(-32602, f"Invalid type for parameter '{param_name}': expected {actual_type.__name__}")
+
+    # For other types, accept as-is if isinstance matches
+    try:
+        if isinstance(value, actual_type):
+            return value
+    except TypeError:
+        # isinstance can fail for some generic types
+        pass
+
+    return value
+
 
 class RPCRegistry:
     def __init__(self):
@@ -47,40 +132,39 @@ class RPCRegistry:
             raise JSONRPCError(-32601, f"Method '{method}' not found")
 
         func = self.methods[method]
-        hints = get_type_hints(func)
+        hints = get_type_hints(func, include_extras=True)
 
         # Remove return annotation if present
         hints.pop("return", None)
 
         if isinstance(params, list):
-            if len(params) != len(hints):
-                raise JSONRPCError(-32602, f"Invalid params: expected {len(hints)} arguments, got {len(params)}")
+            # Count required (non-optional) parameters
+            required_count = sum(1 for h in hints.values() if not _is_optional(h))
+            if len(params) < required_count or len(params) > len(hints):
+                raise JSONRPCError(-32602, f"Invalid params: expected {required_count}-{len(hints)} arguments, got {len(params)}")
 
-            # Validate and convert parameters
+            # Pad with None for missing optional params
+            padded_params = list(params) + [None] * (len(hints) - len(params))
+
             converted_params = []
-            for value, (param_name, expected_type) in zip(params, hints.items()):
-                try:
-                    if not isinstance(value, expected_type):
-                        value = expected_type(value)
-                    converted_params.append(value)
-                except (ValueError, TypeError):
-                    raise JSONRPCError(-32602, f"Invalid type for parameter '{param_name}': expected {expected_type.__name__}")
+            for value, (param_name, expected_type) in zip(padded_params, hints.items()):
+                converted_params.append(_convert_value(value, expected_type, param_name))
 
             return func(*converted_params)
         elif isinstance(params, dict):
-            if set(params.keys()) != set(hints.keys()):
-                raise JSONRPCError(-32602, f"Invalid params: expected {list(hints.keys())}")
+            # Check required parameters are present
+            required_keys = {name for name, hint in hints.items() if not _is_optional(hint)}
+            missing = required_keys - set(params.keys())
+            if missing:
+                raise JSONRPCError(-32602, f"Missing required params: {list(missing)}")
+            extra = set(params.keys()) - set(hints.keys())
+            if extra:
+                raise JSONRPCError(-32602, f"Unknown params: {list(extra)}")
 
-            # Validate and convert parameters
             converted_params = {}
             for param_name, expected_type in hints.items():
                 value = params.get(param_name)
-                try:
-                    if not isinstance(value, expected_type):
-                        value = expected_type(value)
-                    converted_params[param_name] = value
-                except (ValueError, TypeError):
-                    raise JSONRPCError(-32602, f"Invalid type for parameter '{param_name}': expected {expected_type.__name__}")
+                converted_params[param_name] = _convert_value(value, expected_type, param_name)
 
             return func(**converted_params)
         else:
@@ -96,6 +180,64 @@ def jsonrpc(func: Callable) -> Callable:
 def unsafe(func: Callable) -> Callable:
     """Decorator to register mark a function as unsafe"""
     return rpc_registry.mark_unsafe(func)
+
+# --- Output Truncation System ---
+OUTPUT_LIMIT_BYTES = 50 * 1024  # 50KB
+OUTPUT_LIMIT_PREVIEW_ITEMS = 10
+OUTPUT_LIMIT_PREVIEW_STR_LEN = 1000
+OUTPUT_CACHE_MAX_SIZE = 100
+_output_cache: dict[str, str] = {}  # output_id -> json string
+
+
+def _truncate_value(value: Any, depth: int = 0) -> Any:
+    """Create a preview version of a large result by truncating nested content."""
+    if depth > 5:
+        return value
+    if isinstance(value, str) and len(value) > OUTPUT_LIMIT_PREVIEW_STR_LEN:
+        return value[:OUTPUT_LIMIT_PREVIEW_STR_LEN] + f"... [{len(value)} chars total]"
+    if isinstance(value, list):
+        truncated = [_truncate_value(item, depth + 1) for item in value[:OUTPUT_LIMIT_PREVIEW_ITEMS]]
+        if len(value) > OUTPUT_LIMIT_PREVIEW_ITEMS:
+            truncated.append({"_truncated": f"... and {len(value) - OUTPUT_LIMIT_PREVIEW_ITEMS} more items"})
+        return truncated
+    if isinstance(value, dict):
+        return {k: _truncate_value(v, depth + 1) for k, v in value.items()}
+    return value
+
+
+def _cache_and_truncate(result: Any, base_url: str) -> Any:
+    """If result exceeds size limit, cache full output and return truncated preview."""
+    try:
+        serialized = json.dumps(result)
+    except (TypeError, ValueError):
+        return result
+
+    if len(serialized) <= OUTPUT_LIMIT_BYTES:
+        return result
+
+    # Cache full output
+    output_id = str(uuid.uuid4())
+    if len(_output_cache) >= OUTPUT_CACHE_MAX_SIZE:
+        oldest_key = next(iter(_output_cache))
+        del _output_cache[oldest_key]
+    _output_cache[output_id] = serialized
+
+    # Create truncated preview
+    preview = _truncate_value(result)
+    download_url = f"{base_url}/output/{output_id}.json"
+    info = {
+        "_output_truncated": True,
+        "_total_bytes": len(serialized),
+        "_download_url": download_url,
+        "_hint": f"Output truncated ({len(serialized)} bytes > {OUTPUT_LIMIT_BYTES} byte limit). Full output available at: {download_url}",
+    }
+
+    if isinstance(preview, dict):
+        return {**preview, **info}
+    if isinstance(preview, list) and preview:
+        preview.insert(0, info)
+        return preview
+    return {"_preview": preview, **info}
 
 class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
     def send_jsonrpc_error(self, code: int, message: str, id: Any = None):
@@ -114,6 +256,30 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(response_body)))
         self.end_headers()
         self.wfile.write(response_body)
+
+    def do_GET(self):
+        """Handle GET requests for downloading cached output."""
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+
+        # Match /output/<uuid>.json
+        if path.startswith("/output/") and path.endswith(".json"):
+            output_id = path[len("/output/"):-len(".json")]
+            cached = _output_cache.get(output_id)
+            if cached is not None:
+                response_body = cached.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+                return
+
+        # 404 for unknown paths
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Not Found")
 
     def do_POST(self):
         global rpc_registry
@@ -153,6 +319,10 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
 
             # Dispatch the method
             result = rpc_registry.dispatch(request["method"], request.get("params", []))
+
+            # Apply output truncation for large results
+            base_url = f"http://{Server.HOST}:{Server.PORT}"
+            result = _cache_and_truncate(result, base_url)
             response["result"] = result
 
         except JSONRPCError as e:
@@ -201,7 +371,7 @@ class MCPHTTPServer(http.server.HTTPServer):
     allow_reuse_address = False
 
 class Server:
-    HOST = "localhost"
+    HOST = "127.0.0.1"
     PORT = 13337
 
     def __init__(self):
@@ -487,6 +657,28 @@ def parse_address(address: str | int) -> int:
                 raise IDAError(f"Failed to parse address: {address}")
         raise IDAError(f"Failed to parse address (missing 0x prefix): {address}")
 
+def normalize_addr_input(addrs: str) -> list[int]:
+    """Parse a comma-separated list of addresses into integer list.
+    Supports: "0x401000", "0x401000, 0x402000", "main, 0x401000"
+    """
+    result = []
+    for part in addrs.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result.append(parse_address(part))
+        except IDAError:
+            # Try as function name
+            ea = idaapi.get_name_ea(idaapi.BADADDR, part)
+            if ea != idaapi.BADADDR:
+                result.append(ea)
+            else:
+                raise IDAError(f"Cannot resolve address or name: {part}")
+    if not result:
+        raise IDAError("No valid addresses provided")
+    return result
+
 @overload
 def get_function(address: int, *, raise_error: Literal[True]) -> Function: ...
 
@@ -683,17 +875,50 @@ T = TypeVar("T")
 class Page(TypedDict, Generic[T]):
     data: list[T]
     next_offset: Optional[int]
+    cursor: NotRequired[str]
+    total: NotRequired[int]
 
-def paginate(data: list[T], offset: int, count: int) -> Page[T]:
+def paginate(data: list[T], offset: int, count: int, cursor: str | None = None) -> Page[T]:
+    """Paginate a list of items. Supports offset-based and cursor-based pagination.
+    If cursor is provided (hex address string), it overrides offset by finding the
+    first item whose 'address' field is greater than cursor.
+    """
+    if cursor:
+        # Cursor-based: find position after the cursor address
+        try:
+            cursor_val = int(cursor, 0)
+        except ValueError:
+            cursor_val = 0
+        offset = 0
+        for i, item in enumerate(data):
+            addr_str = item.get("address") if isinstance(item, dict) else None
+            if addr_str:
+                try:
+                    if int(addr_str, 0) > cursor_val:
+                        offset = i
+                        break
+                except (ValueError, TypeError):
+                    pass
+            offset = i + 1  # past all items if cursor > all addresses
+
     if count == 0:
         count = len(data)
     next_offset = offset + count
-    if next_offset >= len(data):
-        next_offset = None
-    return {
-        "data": data[offset:offset + count],
-        "next_offset": next_offset,
+    page_data = data[offset:offset + count]
+
+    result: Page[T] = {
+        "data": page_data,
+        "next_offset": next_offset if next_offset < len(data) else None,
+        "total": len(data),
     }
+
+    # Set cursor to last item's address for next page
+    if page_data:
+        last = page_data[-1]
+        if isinstance(last, dict) and "address" in last:
+            result["cursor"] = last["address"]
+
+    return result
 
 def pattern_filter(data: list[T], pattern: str, key: str) -> list[T]:
     if not pattern:
@@ -729,8 +954,8 @@ def list_globals_filter(
     """List matching globals in the database (paginated, filtered)"""
     globals: list[Global] = []
     for addr, name in idautils.Names():
-        # Skip functions and none
-        if not idaapi.get_func(addr) or name is None:
+        # Skip functions and entries with no name
+        if not idaapi.get_func(addr) and name is not None:
             globals += [Global(address=hex(addr), name=name)]
 
     globals = pattern_filter(globals, filter, "name")
@@ -782,6 +1007,42 @@ class String(TypedDict):
     length: int
     string: str
 
+# --- String Cache System ---
+_string_cache: list[String] | None = None
+_string_cache_lock = threading.Lock()
+
+def _build_string_cache() -> list[String]:
+    """Build string cache from IDB (must be called within idaread context)."""
+    strings: list[String] = []
+    for item in idautils.Strings():
+        if item is None:
+            continue
+        try:
+            s = str(item)
+            if s:
+                strings.append(String(address=hex(item.ea), length=item.length, string=s))
+        except:
+            continue
+    return strings
+
+def _get_string_cache() -> list[String]:
+    """Get cached strings, building cache on first access."""
+    global _string_cache
+    if _string_cache is None:
+        with _string_cache_lock:
+            if _string_cache is None:  # Double-check after acquiring lock
+                _string_cache = _build_string_cache()
+    return _string_cache
+
+@jsonrpc
+@idaread
+def invalidate_string_cache() -> str:
+    """Invalidate the string cache, forcing a rebuild on next access"""
+    global _string_cache
+    with _string_cache_lock:
+        _string_cache = None
+    return "String cache invalidated"
+
 @jsonrpc
 @idaread
 def list_strings_filter(
@@ -790,18 +1051,7 @@ def list_strings_filter(
     filter: Annotated[str, "Filter to apply to the list (required parameter, empty string for no filter). Case-insensitive contains or /regex/ syntax"],
 ) -> Page[String]:
     """List matching strings in the database (paginated, filtered)"""
-    strings: list[String] = []
-    for item in idautils.Strings():
-        if item is None:
-            continue
-        try:
-            string = str(item)
-            if string:
-                strings += [
-                    String(address=hex(item.ea), length=item.length, string=string),
-                ]
-        except:
-            continue
+    strings = _get_string_cache()
     strings = pattern_filter(strings, filter, "string")
     return paginate(strings, offset, count)
 
@@ -866,13 +1116,8 @@ def decompile_checked(address: int) -> ida_hexrays.cfunc_t:
         raise IDAError(message)
     return cfunc # type: ignore (this is a SWIG issue)
 
-@jsonrpc
-@idaread
-def decompile_function(
-    address: Annotated[str, "Address of the function to decompile"],
-) -> str:
-    """Decompile a function at the given address"""
-    start = parse_address(address)
+def _decompile_single(start: int) -> str:
+    """Internal: decompile a single function and return pseudocode string."""
     cfunc = decompile_checked(start)
     if is_window_active():
         ida_hexrays.open_pseudocode(start, ida_hexrays.OPF_REUSE)
@@ -898,8 +1143,26 @@ def decompile_function(
             pseudocode += f"/* line: {i} */ {line}"
         else:
             pseudocode += f"/* line: {i}, address: {hex(addr)} */ {line}"
-
     return pseudocode
+
+@jsonrpc
+@idaread
+def decompile_function(
+    address: Annotated[str, "Address(es) to decompile, comma-separated for batch (e.g. '0x401000' or '0x401000,0x402000')"],
+) -> str | list[dict]:
+    """Decompile function(s) at the given address(es). Supports comma-separated batch input."""
+    addrs = normalize_addr_input(address)
+    if len(addrs) == 1:
+        return _decompile_single(addrs[0])
+    # Batch mode: return list of results
+    results = []
+    for addr in addrs:
+        try:
+            code = _decompile_single(addr)
+            results.append({"address": hex(addr), "pseudocode": code, "error": None})
+        except Exception as e:
+            results.append({"address": hex(addr), "pseudocode": None, "error": str(e)})
+    return results
 
 class DisassemblyLine(TypedDict):
     segment: NotRequired[str]
@@ -926,13 +1189,8 @@ class DisassemblyFunction(TypedDict):
     stack_frame: list[StackFrameVariable]
     lines: list[DisassemblyLine]
 
-@jsonrpc
-@idaread
-def disassemble_function(
-    start_address: Annotated[str, "Address of the function to disassemble"],
-) -> DisassemblyFunction:
-    """Get assembly code for a function (API-compatible with older IDA builds)"""
-    start = parse_address(start_address)
+def _disassemble_single(start: int) -> DisassemblyFunction:
+    """Internal: disassemble a single function and return structured result."""
     func = idaapi.get_func(start)
     if not func:
         raise IDAError(f"No function found at address {hex(start)}")
@@ -1004,26 +1262,59 @@ def disassemble_function(
         out["arguments"] = args
     return out
 
+@jsonrpc
+@idaread
+def disassemble_function(
+    start_address: Annotated[str, "Address(es) to disassemble, comma-separated for batch (e.g. '0x401000' or '0x401000,0x402000')"],
+) -> DisassemblyFunction | list[dict]:
+    """Get assembly code for function(s). Supports comma-separated batch input."""
+    addrs = normalize_addr_input(start_address)
+    if len(addrs) == 1:
+        return _disassemble_single(addrs[0])
+    # Batch mode
+    results = []
+    for addr in addrs:
+        try:
+            data = _disassemble_single(addr)
+            results.append({"address": hex(addr), "result": data, "error": None})
+        except Exception as e:
+            results.append({"address": hex(addr), "result": None, "error": str(e)})
+    return results
+
 class Xref(TypedDict):
     address: str
     type: str
     function: Optional[Function]
 
-@jsonrpc
-@idaread
-def get_xrefs_to(
-    address: Annotated[str, "Address to get cross references to"],
-) -> list[Xref]:
-    """Get all cross references to the given address"""
+def _get_xrefs_to_single(ea: int) -> list[Xref]:
+    """Internal: get xrefs to a single address."""
     xrefs = []
     xref: ida_xref.xrefblk_t
-    for xref in idautils.XrefsTo(parse_address(address)): # type: ignore (IDA SDK type hints are incorrect)
+    for xref in idautils.XrefsTo(ea): # type: ignore (IDA SDK type hints are incorrect)
         xrefs += [
             Xref(address=hex(xref.frm),
                  type="code" if xref.iscode else "data",
                  function=get_function(xref.frm, raise_error=False))
         ]
     return xrefs
+
+@jsonrpc
+@idaread
+def get_xrefs_to(
+    address: Annotated[str, "Address(es) to get cross references to, comma-separated for batch"],
+) -> list[Xref] | list[dict]:
+    """Get all cross references to the given address(es). Supports comma-separated batch input."""
+    addrs = normalize_addr_input(address)
+    if len(addrs) == 1:
+        return _get_xrefs_to_single(addrs[0])
+    results = []
+    for addr in addrs:
+        try:
+            xrefs = _get_xrefs_to_single(addr)
+            results.append({"address": hex(addr), "xrefs": xrefs, "error": None})
+        except Exception as e:
+            results.append({"address": hex(addr), "xrefs": [], "error": str(e)})
+    return results
 
 @jsonrpc
 @idaread
@@ -2178,6 +2469,854 @@ def dbg_enable_breakpoint(
     if idaapi.enable_bpt(ea, enable):
         return
     raise IDAError(f"Failed to {'' if enable else 'disable '}breakpoint at address {hex(ea)}")
+
+# ============================================================================
+# Phase 2: New High-Value Analysis Tools
+# ============================================================================
+
+
+@jsonrpc
+@idaread
+def analyze_funcs(
+    addrs: Annotated[str, "Comma-separated function addresses or names (e.g. '0x401000, main')"],
+) -> list[dict]:
+    """Comprehensive function analysis: decompilation, disassembly, xrefs, callees, strings, and basic blocks in one call"""
+    addresses = normalize_addr_input(addrs)
+    results = []
+    for addr in addresses:
+        func = idaapi.get_func(addr)
+        if not func:
+            results.append({"address": hex(addr), "error": f"No function at {hex(addr)}"})
+            continue
+
+        func_name = ida_funcs.get_func_name(func.start_ea) or "<unnamed>"
+        entry = {
+            "address": hex(func.start_ea),
+            "name": func_name,
+            "size": hex(func.end_ea - func.start_ea),
+        }
+
+        # Decompilation (best effort)
+        try:
+            cfunc = decompile_checked(func.start_ea)
+            sv = cfunc.get_pseudocode()
+            pseudocode = ""
+            for i, sl in enumerate(sv):
+                line = ida_lines.tag_remove(sl.line)
+                if pseudocode:
+                    pseudocode += "\n"
+                pseudocode += line
+            entry["decompilation"] = pseudocode
+        except IDAError as e:
+            entry["decompilation_error"] = str(e)
+
+        # Cross-references TO this function
+        xrefs_to = []
+        for xref in idautils.XrefsTo(func.start_ea):
+            caller = get_function(xref.frm, raise_error=False)
+            xrefs_to.append({
+                "address": hex(xref.frm),
+                "type": "code" if xref.iscode else "data",
+                "function": caller["name"] if caller else None,
+            })
+        entry["xrefs_to"] = xrefs_to
+
+        # Callees
+        callees = []
+        for ea_item in idautils.FuncItems(func.start_ea):
+            insn = idaapi.insn_t()
+            idaapi.decode_insn(insn, ea_item)
+            if insn.itype in [idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni]:
+                target = idc.get_operand_value(ea_item, 0)
+                target_type = idc.get_operand_type(ea_item, 0)
+                if target_type in [idaapi.o_mem, idaapi.o_near, idaapi.o_far]:
+                    name = idc.get_name(target)
+                    if name:
+                        callees.append({"address": hex(target), "name": name})
+        # Deduplicate
+        seen = set()
+        unique_callees = []
+        for c in callees:
+            key = c["address"]
+            if key not in seen:
+                seen.add(key)
+                unique_callees.append(c)
+        entry["callees"] = unique_callees
+
+        # Strings referenced in function
+        func_strings = []
+        for ea_item in idautils.FuncItems(func.start_ea):
+            for dref in idautils.DataRefsFrom(ea_item):
+                s = idaapi.get_strlit_contents(dref, -1, 0)
+                if s:
+                    try:
+                        func_strings.append({"address": hex(dref), "value": s.decode("utf-8", errors="replace")})
+                    except:
+                        pass
+        entry["strings"] = func_strings
+
+        # Basic blocks (CFG)
+        try:
+            flow = ida_gdl.FlowChart(func)
+            blocks = []
+            for block in flow:
+                successors = [hex(succ.start_ea) for succ in block.succs()]
+                predecessors = [hex(pred.start_ea) for pred in block.preds()]
+                blocks.append({
+                    "start": hex(block.start_ea),
+                    "end": hex(block.end_ea),
+                    "successors": successors,
+                    "predecessors": predecessors,
+                })
+            entry["basic_blocks"] = blocks
+        except:
+            entry["basic_blocks"] = []
+
+        results.append(entry)
+    return results
+
+
+@jsonrpc
+@idaread
+def find_bytes(
+    pattern: Annotated[str, "Hex byte pattern with ?? wildcards, e.g. '48 89 5C ?? 08' or 'E8 ?? ?? ?? ??'"],
+    max_results: Annotated[int, "Maximum number of results to return (default 100)"],
+) -> list[dict]:
+    """Search for a byte pattern in the binary, supports ?? wildcards"""
+    import ida_search
+    import ida_ida
+
+    # Parse pattern: "48 89 5C ?? 08" -> binary string for IDA
+    # IDA's find_binary uses space-separated hex with ? for wildcards
+    ida_pattern = pattern.strip().upper().replace("??", "?")
+
+    results = []
+    # Search through all segments
+    ea = 0
+    try:
+        if ida_major >= 9:
+            min_ea = ida_ida.inf_get_min_ea()
+            max_ea = ida_ida.inf_get_max_ea()
+        else:
+            info = idaapi.get_inf_structure()
+            min_ea = info.min_ea
+            max_ea = info.max_ea
+    except:
+        min_ea = 0
+        max_ea = idaapi.BADADDR
+
+    ea = min_ea
+    while len(results) < max_results:
+        ea = ida_search.find_binary(ea, max_ea, ida_pattern, 16, ida_search.SEARCH_DOWN | ida_search.SEARCH_NEXT)
+        if ea == idaapi.BADADDR:
+            break
+
+        func = get_function(ea, raise_error=False)
+        result_entry = {
+            "address": hex(ea),
+            "function": func["name"] if func else None,
+        }
+
+        # Get disassembly context (current instruction)
+        mnem = idc.print_insn_mnem(ea)
+        if mnem:
+            ops = []
+            for n in range(4):
+                if idc.get_operand_type(ea, n) == idaapi.o_void:
+                    break
+                ops.append(idc.print_operand(ea, n) or "")
+            result_entry["disassembly"] = f"{mnem} {', '.join(ops)}".rstrip()
+
+        results.append(result_entry)
+        ea += 1  # Move past current match
+
+    return results
+
+
+@jsonrpc
+@idaread
+def find_insns(
+    mnemonics: Annotated[str, "Comma-separated instruction mnemonics to search for, e.g. 'syscall' or 'mov,call'"],
+    function_address: Annotated[Optional[str], "Optional: limit search to a specific function address"],
+    max_results: Annotated[int, "Maximum number of results (default 100)"],
+) -> list[dict]:
+    """Search for instructions by mnemonic(s). If multiple mnemonics given, finds consecutive sequences."""
+    mnem_list = [m.strip().lower() for m in mnemonics.split(",") if m.strip()]
+    if not mnem_list:
+        raise IDAError("No mnemonics provided")
+
+    results = []
+
+    # Determine search range
+    if function_address:
+        addr = parse_address(function_address)
+        func = idaapi.get_func(addr)
+        if not func:
+            raise IDAError(f"No function at {hex(addr)}")
+        items = list(idautils.FuncItems(func.start_ea))
+    else:
+        # Search all functions
+        items = []
+        for func_ea in idautils.Functions():
+            items.extend(idautils.FuncItems(func_ea))
+
+    if len(mnem_list) == 1:
+        # Single mnemonic search
+        target = mnem_list[0]
+        for ea in items:
+            if len(results) >= max_results:
+                break
+            mnem = idc.print_insn_mnem(ea)
+            if mnem and mnem.lower() == target:
+                func = get_function(ea, raise_error=False)
+                ops = []
+                for n in range(4):
+                    if idc.get_operand_type(ea, n) == idaapi.o_void:
+                        break
+                    ops.append(idc.print_operand(ea, n) or "")
+                results.append({
+                    "address": hex(ea),
+                    "instruction": f"{mnem} {', '.join(ops)}".rstrip(),
+                    "function": func["name"] if func else None,
+                })
+    else:
+        # Sequence matching
+        for i in range(len(items) - len(mnem_list) + 1):
+            if len(results) >= max_results:
+                break
+            match = True
+            for j, target in enumerate(mnem_list):
+                mnem = idc.print_insn_mnem(items[i + j])
+                if not mnem or mnem.lower() != target:
+                    match = False
+                    break
+            if match:
+                sequence = []
+                for j in range(len(mnem_list)):
+                    ea = items[i + j]
+                    mnem = idc.print_insn_mnem(ea)
+                    ops = []
+                    for n in range(4):
+                        if idc.get_operand_type(ea, n) == idaapi.o_void:
+                            break
+                        ops.append(idc.print_operand(ea, n) or "")
+                    sequence.append({
+                        "address": hex(ea),
+                        "instruction": f"{mnem} {', '.join(ops)}".rstrip(),
+                    })
+                func = get_function(items[i], raise_error=False)
+                results.append({
+                    "start_address": hex(items[i]),
+                    "function": func["name"] if func else None,
+                    "sequence": sequence,
+                })
+
+    return results
+
+
+@jsonrpc
+@idaread
+def basic_blocks(
+    address: Annotated[str, "Function address to get basic blocks for"],
+) -> dict:
+    """Get control flow graph basic blocks for a function"""
+    addr = parse_address(address)
+    func = idaapi.get_func(addr)
+    if not func:
+        raise IDAError(f"No function at {hex(addr)}")
+
+    func_name = ida_funcs.get_func_name(func.start_ea) or "<unnamed>"
+    flow = ida_gdl.FlowChart(func)
+
+    blocks = []
+    for block in flow:
+        # Get disassembly for this block
+        lines = []
+        ea = block.start_ea
+        while ea < block.end_ea and ea != idaapi.BADADDR:
+            mnem = idc.print_insn_mnem(ea)
+            if mnem:
+                ops = []
+                for n in range(8):
+                    if idc.get_operand_type(ea, n) == idaapi.o_void:
+                        break
+                    ops.append(idc.print_operand(ea, n) or "")
+                lines.append({
+                    "address": hex(ea),
+                    "instruction": f"{mnem} {', '.join(ops)}".rstrip(),
+                })
+            next_ea = idc.next_head(ea, block.end_ea)
+            if next_ea <= ea:
+                break
+            ea = next_ea
+
+        successors = [hex(succ.start_ea) for succ in block.succs()]
+        predecessors = [hex(pred.start_ea) for pred in block.preds()]
+
+        blocks.append({
+            "start": hex(block.start_ea),
+            "end": hex(block.end_ea),
+            "size": block.end_ea - block.start_ea,
+            "lines": lines,
+            "successors": successors,
+            "predecessors": predecessors,
+        })
+
+    return {
+        "function": func_name,
+        "address": hex(func.start_ea),
+        "block_count": len(blocks),
+        "blocks": blocks,
+    }
+
+
+@jsonrpc
+@idaread
+def find_paths(
+    source: Annotated[str, "Source function address or name"],
+    target: Annotated[str, "Target function address or name"],
+    max_depth: Annotated[int, "Maximum search depth (default 10)"],
+) -> list[list[dict]]:
+    """Find execution paths between two functions using BFS on the call graph"""
+    from collections import deque
+
+    src_addrs = normalize_addr_input(source)
+    tgt_addrs = normalize_addr_input(target)
+    src_ea = src_addrs[0]
+    tgt_ea = tgt_addrs[0]
+
+    # Ensure both are function starts
+    src_func = idaapi.get_func(src_ea)
+    tgt_func = idaapi.get_func(tgt_ea)
+    if not src_func:
+        raise IDAError(f"No function at source {hex(src_ea)}")
+    if not tgt_func:
+        raise IDAError(f"No function at target {hex(tgt_ea)}")
+
+    src_ea = src_func.start_ea
+    tgt_ea = tgt_func.start_ea
+
+    if src_ea == tgt_ea:
+        name = ida_funcs.get_func_name(src_ea) or "<unnamed>"
+        return [[{"address": hex(src_ea), "name": name}]]
+
+    # BFS
+    paths = []
+    queue_bfs = deque()
+    queue_bfs.append([src_ea])
+    visited = {src_ea}
+    max_paths = 5
+
+    while queue_bfs and len(paths) < max_paths:
+        current_path = queue_bfs.popleft()
+        if len(current_path) > max_depth:
+            continue
+
+        current_ea = current_path[-1]
+
+        # Get callees of current function
+        func = idaapi.get_func(current_ea)
+        if not func:
+            continue
+
+        callees_set = set()
+        for ea_item in idautils.FuncItems(func.start_ea):
+            for cref in idautils.CodeRefsFrom(ea_item, 0):
+                callee_func = idaapi.get_func(cref)
+                if callee_func and callee_func.start_ea != current_ea:
+                    callees_set.add(callee_func.start_ea)
+
+        for callee_ea in callees_set:
+            if callee_ea == tgt_ea:
+                # Found path
+                full_path = current_path + [tgt_ea]
+                path_info = []
+                for ea in full_path:
+                    name = ida_funcs.get_func_name(ea) or "<unnamed>"
+                    path_info.append({"address": hex(ea), "name": name})
+                paths.append(path_info)
+                if len(paths) >= max_paths:
+                    break
+            elif callee_ea not in visited:
+                visited.add(callee_ea)
+                queue_bfs.append(current_path + [callee_ea])
+
+    return paths
+
+
+@jsonrpc
+@idaread
+def callgraph(
+    address: Annotated[str, "Function address or name"],
+    depth: Annotated[int, "Traversal depth (default 2, max 5)"],
+    direction: Annotated[str, "Direction: 'callers', 'callees', or 'both' (default 'both')"],
+) -> dict:
+    """Get the call graph tree for a function (callers and/or callees)"""
+    addrs = normalize_addr_input(address)
+    addr = addrs[0]
+    func = idaapi.get_func(addr)
+    if not func:
+        raise IDAError(f"No function at {hex(addr)}")
+
+    depth = min(depth, 5)  # Cap depth
+    if direction not in ("callers", "callees", "both"):
+        direction = "both"
+
+    def _get_callees_tree(ea: int, d: int, visited: set) -> dict:
+        name = ida_funcs.get_func_name(ea) or "<unnamed>"
+        node = {"address": hex(ea), "name": name}
+        if d <= 0 or ea in visited:
+            return node
+        visited.add(ea)
+
+        children = []
+        f = idaapi.get_func(ea)
+        if f:
+            callees_set = set()
+            for item_ea in idautils.FuncItems(f.start_ea):
+                insn = idaapi.insn_t()
+                idaapi.decode_insn(insn, item_ea)
+                if insn.itype in [idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni]:
+                    target = idc.get_operand_value(item_ea, 0)
+                    tgt_type = idc.get_operand_type(item_ea, 0)
+                    if tgt_type in [idaapi.o_mem, idaapi.o_near, idaapi.o_far]:
+                        if target != idaapi.BADADDR:
+                            callees_set.add(target)
+            for callee_ea in sorted(callees_set):
+                children.append(_get_callees_tree(callee_ea, d - 1, visited))
+
+        if children:
+            node["callees"] = children
+        visited.discard(ea)
+        return node
+
+    def _get_callers_tree(ea: int, d: int, visited: set) -> dict:
+        name = ida_funcs.get_func_name(ea) or "<unnamed>"
+        node = {"address": hex(ea), "name": name}
+        if d <= 0 or ea in visited:
+            return node
+        visited.add(ea)
+
+        children = []
+        for xref in idautils.CodeRefsTo(ea, 0):
+            caller_func = idaapi.get_func(xref)
+            if caller_func and caller_func.start_ea not in visited:
+                children.append(_get_callers_tree(caller_func.start_ea, d - 1, visited))
+
+        if children:
+            node["callers"] = children
+        visited.discard(ea)
+        return node
+
+    result = {
+        "function": ida_funcs.get_func_name(func.start_ea) or "<unnamed>",
+        "address": hex(func.start_ea),
+        "depth": depth,
+        "direction": direction,
+    }
+
+    if direction in ("callees", "both"):
+        result["callees_tree"] = _get_callees_tree(func.start_ea, depth, set())
+    if direction in ("callers", "both"):
+        result["callers_tree"] = _get_callers_tree(func.start_ea, depth, set())
+
+    return result
+
+
+# Persistent namespace for py_eval (Jupyter-like state)
+_py_eval_namespace: dict = {}
+
+@jsonrpc
+@idawrite
+@unsafe
+def py_eval(
+    code: Annotated[str, "Python code to execute in IDA context. All IDA Python APIs are available."],
+) -> dict:
+    """Execute Python code in the IDA context (Jupyter-style, maintains state across calls). Requires --unsafe flag."""
+    import io
+    import contextlib
+
+    global _py_eval_namespace
+
+    # Pre-populate namespace with common IDA modules if empty
+    if not _py_eval_namespace:
+        _py_eval_namespace.update({
+            "idaapi": idaapi,
+            "idautils": idautils,
+            "idc": idc,
+            "ida_bytes": ida_bytes,
+            "ida_funcs": ida_funcs,
+            "ida_hexrays": ida_hexrays,
+            "ida_nalt": ida_nalt,
+            "ida_typeinf": ida_typeinf,
+            "ida_name": ida_name,
+            "ida_xref": ida_xref,
+            "ida_entry": ida_entry,
+            "ida_kernwin": ida_kernwin,
+            "ida_gdl": ida_gdl,
+            "ida_lines": ida_lines,
+            "ida_ida": ida_ida,
+            "ida_frame": ida_frame,
+        })
+
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+    result_value = None
+
+    try:
+        # Try to evaluate as expression first (for return value)
+        try:
+            compiled = compile(code, "<mcp-eval>", "eval")
+            with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+                result_value = eval(compiled, _py_eval_namespace)
+        except SyntaxError:
+            # Not an expression, execute as statements
+            compiled = compile(code, "<mcp-exec>", "exec")
+            with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+                exec(compiled, _py_eval_namespace)
+    except Exception as e:
+        stderr_capture.write(f"{type(e).__name__}: {e}")
+
+    result = {
+        "stdout": stdout_capture.getvalue(),
+        "stderr": stderr_capture.getvalue(),
+    }
+    if result_value is not None:
+        try:
+            result["result"] = str(result_value)
+        except:
+            result["result"] = repr(result_value)
+
+    return result
+
+
+@jsonrpc
+@idaread
+def search(
+    query: Annotated[str, "Search query: string text, hex address, or numeric value"],
+    search_type: Annotated[str, "Search type: 'string', 'immediate', 'name' (default 'string')"],
+    max_results: Annotated[int, "Maximum results to return (default 50)"],
+) -> list[dict]:
+    """Unified search tool: search for strings, immediate values, or names in the IDB"""
+    import ida_search
+
+    results = []
+
+    if search_type == "string":
+        # Search in string cache
+        strings = _get_string_cache()
+        query_lower = query.lower()
+        for s in strings:
+            if len(results) >= max_results:
+                break
+            if query_lower in s["string"].lower():
+                # Get xrefs to this string
+                str_addr = parse_address(s["address"])
+                xrefs = []
+                for xref in idautils.XrefsTo(str_addr):
+                    func = get_function(xref.frm, raise_error=False)
+                    xrefs.append({
+                        "address": hex(xref.frm),
+                        "function": func["name"] if func else None,
+                    })
+                results.append({
+                    "address": s["address"],
+                    "value": s["string"],
+                    "length": s["length"],
+                    "xrefs": xrefs,
+                })
+
+    elif search_type == "immediate":
+        # Search for immediate value
+        try:
+            value = int(query, 0)
+        except ValueError:
+            raise IDAError(f"Invalid immediate value: {query}")
+
+        try:
+            if ida_major >= 9:
+                min_ea = ida_ida.inf_get_min_ea()
+                max_ea = ida_ida.inf_get_max_ea()
+            else:
+                info = idaapi.get_inf_structure()
+                min_ea = info.min_ea
+                max_ea = info.max_ea
+        except:
+            min_ea = 0
+            max_ea = idaapi.BADADDR
+
+        ea = min_ea
+        while len(results) < max_results:
+            ea = ida_search.find_imm(ea, ida_search.SEARCH_DOWN | ida_search.SEARCH_NEXT, value)
+            if ea is None or (isinstance(ea, tuple) and ea[0] == idaapi.BADADDR):
+                break
+            if isinstance(ea, tuple):
+                ea = ea[0]
+            if ea == idaapi.BADADDR:
+                break
+
+            func = get_function(ea, raise_error=False)
+            mnem = idc.print_insn_mnem(ea) or ""
+            results.append({
+                "address": hex(ea),
+                "instruction": mnem,
+                "function": func["name"] if func else None,
+            })
+            ea += 1
+
+    elif search_type == "name":
+        # Search in names
+        query_lower = query.lower()
+        for addr, name in idautils.Names():
+            if len(results) >= max_results:
+                break
+            if name and query_lower in name.lower():
+                func = get_function(addr, raise_error=False)
+                results.append({
+                    "address": hex(addr),
+                    "name": name,
+                    "is_function": func is not None,
+                })
+    else:
+        raise IDAError(f"Unknown search type: {search_type}. Use 'string', 'immediate', or 'name'")
+
+    return results
+
+# ============================================================================
+# Phase 3: Batch Operations & Advanced Analysis Tools
+# ============================================================================
+
+@jsonrpc
+@idaread
+def analyze_strings(
+    filter_pattern: Annotated[str, "String filter pattern (substring match, case-insensitive). Empty string for all."],
+    min_length: Annotated[int, "Minimum string length to include (default 4)"] = 4,
+    with_xrefs: Annotated[bool, "Include cross-references to each string (default True)"] = True,
+    max_results: Annotated[int, "Maximum number of results (default 100)"] = 100,
+) -> list[dict]:
+    """Advanced string analysis with filtering, length constraints, and cross-reference associations.
+    Returns strings matching the filter with their xrefs, showing which functions reference them."""
+    cache = _get_string_cache()
+    results = []
+    filter_lower = filter_pattern.lower() if filter_pattern else ""
+
+    for s in cache:
+        if len(results) >= max_results:
+            break
+        value = s.get("value", "")
+        if len(value) < min_length:
+            continue
+        if filter_lower and filter_lower not in value.lower():
+            continue
+
+        entry = {
+            "address": s["address"],
+            "value": value,
+            "length": s.get("length", len(value)),
+            "type": s.get("type", "unknown"),
+        }
+
+        if with_xrefs:
+            ea = int(s["address"], 0) if isinstance(s["address"], str) else s["address"]
+            xref_list = []
+            for xref in idautils.XrefsTo(ea):
+                func = get_function(xref.frm, raise_error=False)
+                xref_list.append({
+                    "address": hex(xref.frm),
+                    "function": func["name"] if func else None,
+                })
+            entry["xrefs"] = xref_list
+            entry["xref_count"] = len(xref_list)
+
+        results.append(entry)
+
+    return results
+
+@jsonrpc
+@idaread
+def export_funcs(
+    addrs: Annotated[str, "Comma-separated function addresses or names (e.g. '0x401000, main')"],
+    format: Annotated[str, "Export format: 'json' (default), 'c_header', or 'prototype'"] = "json",
+) -> list[dict] | str:
+    """Export function information in various formats. Supports JSON, C header declarations, and prototypes."""
+    addresses = normalize_addr_input(addrs)
+    results = []
+
+    for addr in addresses:
+        func = idaapi.get_func(addr)
+        if not func:
+            results.append({"address": hex(addr), "error": f"No function at {hex(addr)}"})
+            continue
+
+        func_name = ida_funcs.get_func_name(func.start_ea) or f"sub_{func.start_ea:X}"
+        size = func.end_ea - func.start_ea
+
+        # Get type info
+        rettype_str = "int"
+        args_list = []
+        tif = ida_typeinf.tinfo_t()
+        if ida_nalt.get_tinfo(tif, func.start_ea) and tif.is_func():
+            ftd = ida_typeinf.func_type_data_t()
+            if tif.get_func_details(ftd):
+                rettype_str = str(ftd.rettype)
+                args_list = [(a.name or f"arg{i}", str(a.type)) for i, a in enumerate(ftd)]
+
+        if format == "json":
+            entry = {
+                "address": hex(func.start_ea),
+                "name": func_name,
+                "size": size,
+                "return_type": rettype_str,
+                "arguments": [{"name": n, "type": t} for n, t in args_list],
+            }
+            # Try decompilation
+            try:
+                entry["pseudocode"] = _decompile_single(func.start_ea)
+            except Exception:
+                entry["pseudocode"] = None
+            results.append(entry)
+
+        elif format == "c_header":
+            args_str = ", ".join(f"{t} {n}" for n, t in args_list) if args_list else "void"
+            results.append({
+                "address": hex(func.start_ea),
+                "declaration": f"{rettype_str} {func_name}({args_str});",
+            })
+
+        elif format == "prototype":
+            args_str = ", ".join(f"{t} {n}" for n, t in args_list) if args_list else "void"
+            results.append({
+                "address": hex(func.start_ea),
+                "prototype": f"{rettype_str} {func_name}({args_str})",
+            })
+
+        else:
+            raise IDAError(f"Unknown format: {format}. Use 'json', 'c_header', or 'prototype'")
+
+    return results
+
+@jsonrpc
+@idaread
+def xref_matrix(
+    addrs: Annotated[str, "Comma-separated function addresses to analyze relationships between"],
+) -> dict:
+    """Generate a cross-reference matrix between multiple functions.
+    Matrix values: 0=no relation, 1=row calls col, 2=col calls row, 3=bidirectional."""
+    addresses = normalize_addr_input(addrs)
+    addr_set = set(addresses)
+
+    # Build function info
+    functions = []
+    for addr in addresses:
+        func = idaapi.get_func(addr)
+        name = ida_funcs.get_func_name(addr) if func else hex(addr)
+        functions.append({"address": hex(addr), "name": name or hex(addr)})
+
+    n = len(addresses)
+    matrix = [[0] * n for _ in range(n)]
+
+    for i, src_addr in enumerate(addresses):
+        # Find all callees of src
+        callees = set()
+        func = idaapi.get_func(src_addr)
+        if func:
+            for ea in idautils.FuncItems(func.start_ea):
+                for ref in idautils.CodeRefsFrom(ea, False):
+                    ref_func = idaapi.get_func(ref)
+                    if ref_func:
+                        callees.add(ref_func.start_ea)
+
+        for j, tgt_addr in enumerate(addresses):
+            if i == j:
+                continue
+            tgt_func = idaapi.get_func(tgt_addr)
+            tgt_start = tgt_func.start_ea if tgt_func else tgt_addr
+            if tgt_start in callees:
+                matrix[i][j] |= 1  # i calls j
+
+    # Compute bidirectional: if i calls j AND j calls i => 3
+    for i in range(n):
+        for j in range(i + 1, n):
+            if matrix[i][j] == 1 and matrix[j][i] == 1:
+                matrix[i][j] = 3
+                matrix[j][i] = 3
+            elif matrix[j][i] == 1:
+                matrix[i][j] |= 2  # col calls row from i's perspective
+
+    return {
+        "functions": functions,
+        "matrix": matrix,
+        "legend": {"0": "no relation", "1": "row calls col", "2": "col calls row", "3": "bidirectional"},
+    }
+
+@jsonrpc
+@idaread
+def find_insn_operands(
+    mnemonic: Annotated[str, "Instruction mnemonic to search for (e.g. 'mov', 'call')"],
+    operand: Annotated[str, "Operand pattern to match (substring, e.g. 'rax', 'eax', '[rbp')"],
+    function_address: Annotated[str, "Optional: limit search to a specific function address"] = "",
+    max_results: Annotated[int, "Maximum results to return (default 50)"] = 50,
+) -> list[dict]:
+    """Find instructions matching a mnemonic and operand pattern.
+    Useful for finding all instructions accessing a specific register, memory pattern, or address."""
+    results = []
+    mnemonic_lower = mnemonic.lower()
+    operand_lower = operand.lower()
+
+    if function_address:
+        # Search within specific function
+        addr = parse_address(function_address)
+        func = idaapi.get_func(addr)
+        if not func:
+            raise IDAError(f"No function at {function_address}")
+        items = idautils.FuncItems(func.start_ea)
+    else:
+        # Search all segments
+        items = []
+        for seg_ea in idautils.Segments():
+            seg = idaapi.getseg(seg_ea)
+            if seg:
+                ea = seg.start_ea
+                while ea < seg.end_ea and ea != idaapi.BADADDR:
+                    items.append(ea)
+                    ea = idc.next_head(ea, seg.end_ea)
+
+    for ea in items:
+        if len(results) >= max_results:
+            break
+
+        insn_mnem = (idc.print_insn_mnem(ea) or "").lower()
+        if insn_mnem != mnemonic_lower:
+            continue
+
+        # Check operands
+        matched_ops = []
+        for n in range(8):
+            if idc.get_operand_type(ea, n) == idaapi.o_void:
+                break
+            op_str = idc.print_operand(ea, n) or ""
+            if operand_lower in op_str.lower():
+                matched_ops.append({"index": n, "text": op_str})
+
+        if matched_ops:
+            func = get_function(ea, raise_error=False)
+            disasm = idc.generate_disasm_line(ea, 0) if hasattr(idc, 'generate_disasm_line') else f"{insn_mnem}"
+            # Fallback: build disasm manually
+            ops_all = []
+            for n in range(8):
+                if idc.get_operand_type(ea, n) == idaapi.o_void:
+                    break
+                ops_all.append(idc.print_operand(ea, n) or "")
+            disasm = f"{idc.print_insn_mnem(ea)} {', '.join(ops_all)}".rstrip()
+
+            results.append({
+                "address": hex(ea),
+                "instruction": disasm,
+                "matched_operands": matched_ops,
+                "function": func["name"] if func else None,
+            })
+
+    return results
 
 class MCP(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
