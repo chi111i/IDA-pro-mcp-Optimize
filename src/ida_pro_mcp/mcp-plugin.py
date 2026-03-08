@@ -539,6 +539,47 @@ class Server:
 
     # --- Multi-instance registry integration ---
 
+    @staticmethod
+    def _gather_ida_metadata() -> dict:
+        """Gather IDA metadata on the main thread.
+
+        Must be called via idaapi.execute_sync() since IDA API calls
+        (get_root_filename, get_input_file_path, etc.) only return
+        correct values when executed on the IDA main thread.
+        """
+        result = {
+            "idb_path": "",
+            "binary_name": "unknown",
+            "binary_path": "",
+            "arch": "unknown",
+        }
+        try:
+            import idaapi as _idaapi
+            input_path = _idaapi.get_input_file_path()
+            root_name = _idaapi.get_root_filename()
+            if input_path:
+                result["idb_path"] = input_path
+                result["binary_path"] = input_path
+            if root_name:
+                result["binary_name"] = root_name
+            # Architecture detection (IDA 9.x vs 8.x)
+            try:
+                import ida_ida
+                bits = "64" if ida_ida.inf_is_64bit() else "32"
+                proc = ida_ida.inf_get_procname()
+                result["arch"] = f"{proc}{bits}"
+            except (ImportError, AttributeError):
+                try:
+                    info = _idaapi.get_inf_structure()
+                    bits = "64" if info.is_64bit() else "32"
+                    proc = info.procname
+                    result["arch"] = f"{proc}{bits}"
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return result
+
     def _register(self) -> None:
         """Register this IDA instance in the file-based registry."""
         if not _HAS_REGISTRY or self.actual_port is None:
@@ -548,33 +589,17 @@ class Server:
             pid = os.getpid()
             port = self.actual_port
 
-            # Gather IDA metadata (compatible with IDA 8.x and 9.x)
-            idb_path = ""
-            binary_name = "unknown"
-            binary_path = ""
-            arch = "unknown"
-            try:
-                import idc
-                import idaapi as _idaapi
-                idb_path = _idaapi.get_input_file_path()
-                binary_name = _idaapi.get_root_filename()
-                binary_path = _idaapi.get_input_file_path()
-                # Architecture detection (IDA 9.x vs 8.x)
-                try:
-                    import ida_ida
-                    bits = "64" if ida_ida.inf_is_64bit() else "32"
-                    proc = ida_ida.inf_get_procname()
-                    arch = f"{proc}{bits}"
-                except (ImportError, AttributeError):
-                    try:
-                        info = _idaapi.get_inf_structure()
-                        bits = "64" if info.is_64bit() else "32"
-                        proc = info.procname
-                        arch = f"{proc}{bits}"
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            # Gather IDA metadata on the main thread via execute_sync
+            metadata_container = queue.Queue()
+            def _collect_metadata():
+                metadata_container.put(Server._gather_ida_metadata())
+            idaapi.execute_sync(_collect_metadata, idaapi.MFF_READ)
+            meta = metadata_container.get()
+
+            idb_path = meta["idb_path"]
+            binary_name = meta["binary_name"]
+            binary_path = meta["binary_path"]
+            arch = meta["arch"]
 
             self.instance_id = self._registry.register(
                 pid=pid,
