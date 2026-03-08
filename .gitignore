@@ -25,3 +25,4 @@ venv*/
 
 # Generated server files
 server_generated.py
+.ace-tool/

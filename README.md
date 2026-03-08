@@ -144,6 +144,58 @@ Another thing to keep in mind is that LLMs will not perform well on obfuscated c
 
 You should also use a tool like Lumina or FLIRT to try and resolve all the open source library code and the C++ STL, this will further improve the accuracy.
 
+## Multi-Instance Mode
+
+v2.0 adds multi-instance support, allowing a single MCP endpoint to control multiple IDA Pro instances simultaneously. This is useful when reverse engineering multiple binaries at once or when collaborating with different IDA sessions.
+
+### How it works
+
+- **Auto-detection**: When `~/.ida-mcp/instances.json` exists with registered instances, multi-instance mode activates automatically. Otherwise, single-instance mode is used.
+- **Instance registration**: Each IDA Pro with the MCP plugin automatically registers itself in the shared registry file using a deterministic 4-character ID (e.g., `k7m2`).
+- **Auto-routing**: When only one instance is registered, requests are routed automatically without requiring `instance_id`.
+- **Health checks**: Dead instances are automatically cleaned up on startup and via `refresh_instances()`.
+
+### Multi-instance management tools
+
+- `list_instances()`: List all registered IDA instances with their binary name, architecture, port, and PID.
+- `get_cached_output(cache_id, offset, size)`: Retrieve paginated results from cached large outputs.
+- `refresh_instances()`: Clean up dead instances and auto-discover new ones.
+
+### Usage
+
+```sh
+# Auto-detection (recommended): starts in multi-instance mode if registry exists
+uv run ida-pro-mcp
+
+# Force multi-instance mode
+uv run ida-pro-mcp --multi
+
+# Force single-instance mode (legacy)
+uv run ida-pro-mcp --ida-rpc 127.0.0.1:13337
+```
+
+When multiple instances are registered, every tool call requires an `instance_id` parameter:
+
+```json
+{
+  "tool": "decompile_function",
+  "arguments": {
+    "address": "0x401000",
+    "instance_id": "k7m2"
+  }
+}
+```
+
+### Architecture
+
+```
+LLM Client -> MCP Server -> InstanceRouter -> IDA Instance A (port 7000)
+                                           -> IDA Instance B (port 7001)
+                                           -> IDA Instance C (port 7002)
+```
+
+Each IDA instance runs its own HTTP JSON-RPC server on an OS-assigned port (replacing the hardcoded 13337). Instance metadata is stored in `~/.ida-mcp/instances.json` with cross-platform file locking.
+
 ## SSE Transport & Headless MCP
 
 You can run an SSE server to connect to the user interface like this:
@@ -246,6 +298,19 @@ uv run mcp dev src/ida_pro_mcp/server.py
 ```
 
 This will open a web interface at http://localhost:5173 and allow you to interact with the MCP tools for testing.
+
+### Running Tests
+
+```sh
+# Run all tests
+uv run pytest tests/ -v
+
+# Run a specific test module
+uv run pytest tests/test_registry.py -v
+
+# Run with coverage (install pytest-cov first)
+uv run pytest tests/ --cov=ida_pro_mcp --cov-report=term-missing
+```
 
 For testing I create a symbolic link to the IDA plugin and then POST a JSON-RPC request directly to `http://localhost:13337/mcp`. After [enabling symbolic links](https://learn.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development) you can run the following command:
 

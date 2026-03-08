@@ -1,33 +1,88 @@
 import os
 import sys
-import ast
 import json
 import shutil
 import argparse
+import itertools
 import http.client
 from urllib.parse import urlparse
 from glob import glob
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
+
+# Multi-instance support (graceful degradation if modules not available)
+try:
+    from ida_pro_mcp.registry import InstanceRegistry, get_default_registry_path
+    from ida_pro_mcp.router import InstanceRouter
+    from ida_pro_mcp.cache import get_cache, DEFAULT_MAX_OUTPUT_CHARS
+    from ida_pro_mcp.health import cleanup_stale_instances, rediscover_instances
+    from ida_pro_mcp.tools.management import (
+        list_instances as _list_instances_impl,
+        get_cached_output as _get_cached_output_impl,
+        refresh_instances as _refresh_instances_impl,
+    )
+    _HAS_MULTI_INSTANCE = True
+except ImportError:
+    _HAS_MULTI_INSTANCE = False
 
 # The log_level is necessary for Cline to work: https://github.com/jlowin/fastmcp/issues/81
 mcp = FastMCP("ida-pro-mcp", log_level="ERROR")
 
-jsonrpc_request_id = 1
+# Thread-safe JSON-RPC request ID counter
+_jsonrpc_id_counter = itertools.count(1)
 ida_host = "127.0.0.1"
 ida_port = 13337
 
-def make_jsonrpc_request(method: str, *params):
-    """Make a JSON-RPC request to the IDA plugin"""
-    global jsonrpc_request_id, ida_host, ida_port
-    conn = http.client.HTTPConnection(ida_host, ida_port)
+# Multi-instance state (initialized in main() when --multi is active)
+_registry: "InstanceRegistry | None" = None
+_router: "InstanceRouter | None" = None
+_multi_instance_mode = False
+
+def make_jsonrpc_request(method: str, *params, instance_id: str | None = None):
+    """Make a JSON-RPC request to the IDA plugin.
+
+    In multi-instance mode, routes through InstanceRouter when
+    ``instance_id`` is provided or auto-routes to the single instance.
+    In single-instance mode (default), connects directly to ida_host:ida_port.
+    """
+    global ida_host, ida_port, _router, _multi_instance_mode
+
+    # Multi-instance: route through InstanceRouter
+    if _multi_instance_mode and _router is not None:
+        rpc_params = {
+            "arguments": {"instance_id": instance_id} if instance_id else {},
+            "method_params": list(params),
+        }
+        result = _router.route_request(method, rpc_params)
+
+        # Check for router-level errors
+        if isinstance(result, dict) and "error" in result:
+            error_msg = result["error"]
+            hint = result.get("hint", "")
+            msg = f"Router error: {error_msg}"
+            if hint:
+                msg += f"\nHint: {hint}"
+            # Include available instances for discoverability
+            if "available_instances" in result:
+                msg += f"\nAvailable instances: {json.dumps(result['available_instances'], indent=2)}"
+            if "replacements" in result:
+                msg += f"\nReplacements: {json.dumps(result['replacements'], indent=2)}"
+            raise Exception(msg)
+
+        # Normalize empty results
+        if result is None:
+            result = "success"
+        return result
+
+    # Single-instance: direct connection
+    conn = http.client.HTTPConnection(ida_host, ida_port, timeout=300.0)
     request = {
         "jsonrpc": "2.0",
         "method": method,
         "params": list(params),
-        "id": jsonrpc_request_id,
+        "id": next(_jsonrpc_id_counter),
     }
-    jsonrpc_request_id += 1
 
     try:
         conn.request("POST", "/mcp", json.dumps(request), {
@@ -50,16 +105,25 @@ def make_jsonrpc_request(method: str, *params):
         if result is None:
             result = "success"
         return result
-    except Exception:
-        raise
+    except ConnectionRefusedError:
+        raise Exception(
+            f"Connection refused to IDA at {ida_host}:{ida_port}. "
+            f"Is the MCP plugin running? Use Edit -> Plugins -> MCP to start it."
+        )
+    except (TimeoutError, OSError) as e:
+        raise Exception(
+            f"Connection to IDA at {ida_host}:{ida_port} timed out. "
+            f"IDA may be busy with a long operation (single-threaded). "
+            f"Wait and retry. ({type(e).__name__})"
+        )
     finally:
         conn.close()
 
 @mcp.tool()
-def check_connection() -> str:
+def check_connection(instance_id: Optional[str] = None) -> str:
     """Check if the IDA plugin is running"""
     try:
-        metadata = make_jsonrpc_request("get_metadata")
+        metadata = make_jsonrpc_request("get_metadata", instance_id=instance_id)
         return f"Successfully connected to IDA Pro (open file: {metadata['module']})"
     except Exception as e:
         if sys.platform == "darwin":
@@ -68,155 +132,50 @@ def check_connection() -> str:
             shortcut = "Ctrl+Alt+M"
         return f"Failed to connect to IDA Pro! Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?"
 
-# Code taken from https://github.com/mrexodia/ida-pro-mcp (MIT License)
-class MCPVisitor(ast.NodeVisitor):
-    def __init__(self):
-        self.types: dict[str, ast.ClassDef] = {}
-        self.functions: dict[str, ast.FunctionDef] = {}
-        self.descriptions: dict[str, str] = {}
-        self.unsafe: list[str] = []
-
-    def visit_FunctionDef(self, node):
-        for decorator in node.decorator_list:
-            if isinstance(decorator, ast.Name):
-                if decorator.id == "jsonrpc":
-                    for i, arg in enumerate(node.args.args):
-                        arg_name = arg.arg
-                        arg_type = arg.annotation
-                        if arg_type is None:
-                            raise Exception(f"Missing argument type for {node.name}.{arg_name}")
-                        if isinstance(arg_type, ast.Subscript):
-                            assert isinstance(arg_type.value, ast.Name)
-                            assert arg_type.value.id == "Annotated"
-                            assert isinstance(arg_type.slice, ast.Tuple)
-                            assert len(arg_type.slice.elts) == 2
-                            annot_type = arg_type.slice.elts[0]
-                            annot_description = arg_type.slice.elts[1]
-                            assert isinstance(annot_description, ast.Constant)
-                            node.args.args[i].annotation = ast.Subscript(
-                                value=ast.Name(id="Annotated", ctx=ast.Load()),
-                                slice=ast.Tuple(
-                                    elts=[
-                                    annot_type,
-                                    ast.Call(
-                                        func=ast.Name(id="Field", ctx=ast.Load()),
-                                        args=[],
-                                        keywords=[
-                                        ast.keyword(
-                                            arg="description",
-                                            value=annot_description)])],
-                                    ctx=ast.Load()),
-                                ctx=ast.Load())
-                        elif isinstance(arg_type, ast.Name):
-                            pass
-                        else:
-                            raise Exception(f"Unexpected type annotation for {node.name}.{arg_name} -> {type(arg_type)}")
-
-                    body_comment = node.body[0]
-                    if isinstance(body_comment, ast.Expr) and isinstance(body_comment.value, ast.Constant):
-                        new_body = [body_comment]
-                        self.descriptions[node.name] = body_comment.value.value
-                    else:
-                        new_body = []
-
-                    call_args = [ast.Constant(value=node.name)]
-                    for arg in node.args.args:
-                        call_args.append(ast.Name(id=arg.arg, ctx=ast.Load()))
-                    new_body.append(ast.Return(
-                        value=ast.Call(
-                            func=ast.Name(id="make_jsonrpc_request", ctx=ast.Load()),
-                            args=call_args,
-                            keywords=[])))
-                    decorator_list = [
-                        ast.Call(
-                            func=ast.Attribute(
-                                value=ast.Name(id="mcp", ctx=ast.Load()),
-                                attr="tool",
-                                ctx=ast.Load()),
-                            args=[],
-                            keywords=[]
-                        )
-                    ]
-                    node_nobody = ast.FunctionDef(node.name, node.args, new_body, decorator_list, node.returns, node.type_comment, lineno=node.lineno, col_offset=node.col_offset)
-                    assert node.name not in self.functions, f"Duplicate function: {node.name}"
-                    self.functions[node.name] = node_nobody
-                elif decorator.id == "unsafe":
-                    self.unsafe.append(node.name)
-
-    def visit_ClassDef(self, node):
-        for base in node.bases:
-            if isinstance(base, ast.Name):
-                if base.id == "TypedDict":
-                    self.types[node.name] = node
-
+# Tool registry: AST-based tool extraction from mcp-plugin.py
+from ida_pro_mcp.tool_registry import (
+    parse_plugin_file,
+    generate_code,
+    write_generated_file,
+    generate_tool_schemas,
+)
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 IDA_PLUGIN_PY = os.path.join(SCRIPT_DIR, "mcp-plugin.py")
 GENERATED_PY = os.path.join(SCRIPT_DIR, "server_generated.py")
 
 # NOTE: This is in the global scope on purpose
-if not os.path.exists(IDA_PLUGIN_PY):
-    raise RuntimeError(f"IDA plugin not found at {IDA_PLUGIN_PY} (did you move it?)")
-with open(IDA_PLUGIN_PY, "r", encoding="utf-8") as f:
-    code = f.read()
-module = ast.parse(code, IDA_PLUGIN_PY)
-visitor = MCPVisitor()
-visitor.visit(module)
-code = """# NOTE: This file has been automatically generated, do not modify!
-# Architecture based on https://github.com/mrexodia/ida-pro-mcp (MIT License)
-import sys
-if sys.version_info >= (3, 12):
-    from typing import Annotated, Optional, TypedDict, Generic, TypeVar, NotRequired
-else:
-    from typing_extensions import Annotated, Optional, TypedDict, Generic, TypeVar, NotRequired
-from pydantic import Field
-
-T = TypeVar("T")
-
-"""
-for type in visitor.types.values():
-    code += ast.unparse(type)
-    code += "\n\n"
-for function in visitor.functions.values():
-    code += ast.unparse(function)
-    code += "\n\n"
-
-try:
-    if os.path.exists(GENERATED_PY):
-        with open(GENERATED_PY, "rb") as f:
-            existing_code_bytes = f.read()
-    else:
-        existing_code_bytes = b""
-    code_bytes = code.encode("utf-8").replace(b"\r", b"")
-    if code_bytes != existing_code_bytes:
-        with open(GENERATED_PY, "wb") as f:
-            f.write(code_bytes)
-except:
-    print(f"Failed to generate code: {GENERATED_PY}", file=sys.stderr, flush=True)
+parse_result = parse_plugin_file(IDA_PLUGIN_PY)
+code = generate_code(parse_result)
+write_generated_file(code, GENERATED_PY)
 
 exec(compile(code, GENERATED_PY, "exec"))
 
-MCP_FUNCTIONS = ["check_connection"] + list(visitor.functions.keys())
-UNSAFE_FUNCTIONS = visitor.unsafe
+MCP_FUNCTIONS = ["check_connection"] + list(parse_result.functions.keys())
+UNSAFE_FUNCTIONS = parse_result.unsafe
 SAFE_FUNCTIONS = [f for f in MCP_FUNCTIONS if f not in UNSAFE_FUNCTIONS]
+
+# Management tools are always safe (read-only operations)
+MANAGEMENT_FUNCTIONS = ["list_instances", "get_cached_output", "refresh_instances"]
+SAFE_FUNCTIONS = SAFE_FUNCTIONS + MANAGEMENT_FUNCTIONS
 
 def generate_readme():
     print("README:")
     print(f"- `check_connection()`: Check if the IDA plugin is running.")
     def get_description(name: str):
-        function = visitor.functions[name]
+        function = parse_result.functions[name]
         signature = function.name + "("
         for i, arg in enumerate(function.args.args):
             if i > 0:
                 signature += ", "
             signature += arg.arg
         signature += ")"
-        description = visitor.descriptions.get(function.name, "<no description>").strip().split("\n")[0]
+        description = parse_result.descriptions.get(function.name, "<no description>").strip().split("\n")[0]
         if description[-1] != ".":
             description += "."
         return f"- `{signature}`: {description}"
     for safe_function in SAFE_FUNCTIONS:
-        if safe_function != "check_connection":
+        if safe_function != "check_connection" and safe_function in parse_result.functions:
             print(get_description(safe_function))
     print("\nUnsafe functions (`--unsafe` flag required):\n")
     for unsafe_function in UNSAFE_FUNCTIONS:
@@ -455,8 +414,108 @@ def install_ida_plugin(*, uninstall: bool = False, quiet: bool = False):
             if not quiet:
                 print(f"Installed IDA Pro plugin (IDA restart required)\n  Plugin: {plugin_destination}")
 
+def _init_multi_instance() -> bool:
+    """Initialize multi-instance mode: registry, health checks, auto-discovery.
+
+    Returns:
+        True if multi-instance mode was successfully initialized.
+    """
+    global _registry, _router, _multi_instance_mode
+
+    if not _HAS_MULTI_INSTANCE:
+        print(
+            "[ida-pro-mcp] Multi-instance modules not available. "
+            "Running in single-instance mode.",
+            file=sys.stderr,
+        )
+        return False
+
+    try:
+        _registry = InstanceRegistry()
+
+        # Startup health check: remove dead instances
+        removed = cleanup_stale_instances(_registry)
+        if removed:
+            print(
+                f"[ida-pro-mcp] Cleaned up {len(removed)} dead instance(s): {removed}",
+                file=sys.stderr,
+            )
+
+        # Auto-discover running IDA instances
+        instances = _registry.list_instances()
+        if not instances:
+            print("[ida-pro-mcp] No instances in registry, attempting auto-discovery...", file=sys.stderr)
+            discovered = rediscover_instances(_registry)
+            if discovered:
+                print(f"[ida-pro-mcp] Auto-discovered {len(discovered)} instance(s): {discovered}", file=sys.stderr)
+            else:
+                print("[ida-pro-mcp] No IDA instances found. Tools will be available once IDA connects.", file=sys.stderr)
+        else:
+            print(f"[ida-pro-mcp] Found {len(instances)} registered instance(s).", file=sys.stderr)
+
+        _router = InstanceRouter(_registry)
+        _multi_instance_mode = True
+
+        # Register management tools
+        _register_management_tools()
+
+        return True
+    except Exception as e:
+        print(
+            f"[ida-pro-mcp] Failed to initialize multi-instance mode: {e}. "
+            f"Falling back to single-instance mode.",
+            file=sys.stderr,
+        )
+        _registry = None
+        _router = None
+        _multi_instance_mode = False
+        return False
+
+
+def _register_management_tools():
+    """Register multi-instance management tools with the MCP server."""
+    global _registry
+
+    @mcp.tool()
+    def list_instances() -> str:
+        """List all registered IDA instances.
+
+        Returns information about all active IDA Pro instances including
+        their instance ID, binary name, architecture, host, port, and
+        registration time. Use the returned instance_id values in other
+        tool calls to target a specific instance.
+        """
+        result = _list_instances_impl(_registry)
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    @mcp.tool()
+    def get_cached_output(
+        cache_id: str,
+        offset: int = 0,
+        size: int = 50000,
+    ) -> str:
+        """Retrieve cached output from a previous tool call.
+
+        When a tool response is too large, it is cached and a cache_id is
+        returned. Use this tool to retrieve the full output in pages.
+        """
+        result = _get_cached_output_impl(cache_id, offset=offset, size=size)
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    @mcp.tool()
+    def refresh_instances() -> str:
+        """Refresh the instance registry.
+
+        Removes dead instances and auto-discovers running IDA instances
+        with MCP plugins. Call this when you expect IDA instances to have
+        started or stopped.
+        """
+        result = _refresh_instances_impl(_registry)
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+
 def main():
-    global ida_host, ida_port
+    global ida_host, ida_port, _multi_instance_mode
     parser = argparse.ArgumentParser(description="IDA Pro MCP Server")
     parser.add_argument("--install", action="store_true", help="Install the MCP Server and IDA plugin")
     parser.add_argument("--uninstall", action="store_true", help="Uninstall the MCP Server and IDA plugin")
@@ -466,6 +525,10 @@ def main():
     parser.add_argument("--ida-rpc", type=str, default=f"http://{ida_host}:{ida_port}", help=f"IDA RPC server to use (default: http://{ida_host}:{ida_port})")
     parser.add_argument("--unsafe", action="store_true", help="Enable unsafe functions (DANGEROUS)")
     parser.add_argument("--config", action="store_true", help="Generate MCP config JSON")
+    parser.add_argument(
+        "--multi", action="store_true",
+        help="Enable multi-instance mode (auto-detect and route to multiple IDA instances)",
+    )
     args = parser.parse_args()
 
     if args.install and args.uninstall:
@@ -495,12 +558,33 @@ def main():
         print_mcp_config()
         return
 
-    # Parse IDA RPC server argument
-    ida_rpc = urlparse(args.ida_rpc)
-    if ida_rpc.hostname is None or ida_rpc.port is None:
-        raise Exception(f"Invalid IDA RPC server: {args.ida_rpc}")
-    ida_host = ida_rpc.hostname
-    ida_port = ida_rpc.port
+    # Multi-instance mode: auto-detection or explicit --multi flag
+    if args.multi:
+        _init_multi_instance()
+    elif _HAS_MULTI_INSTANCE:
+        # Auto-detection: check if registry file exists with instances
+        try:
+            registry_path = get_default_registry_path()
+            if os.path.exists(registry_path):
+                with open(registry_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data.get("instances"):
+                    print(
+                        "[ida-pro-mcp] Registry file found with instances, "
+                        "auto-enabling multi-instance mode.",
+                        file=sys.stderr,
+                    )
+                    _init_multi_instance()
+        except Exception:
+            pass  # Silently fall through to single-instance mode
+
+    # Single-instance mode: parse IDA RPC server argument
+    if not _multi_instance_mode:
+        ida_rpc = urlparse(args.ida_rpc)
+        if ida_rpc.hostname is None or ida_rpc.port is None:
+            raise Exception(f"Invalid IDA RPC server: {args.ida_rpc}")
+        ida_host = ida_rpc.hostname
+        ida_port = ida_rpc.port
 
     # Remove unsafe tools
     if not args.unsafe:
@@ -519,7 +603,8 @@ def main():
             mcp.settings.host = url.hostname
             mcp.settings.port = url.port
             # NOTE: npx @modelcontextprotocol/inspector for debugging
-            print(f"MCP Server availabile at http://{mcp.settings.host}:{mcp.settings.port}/sse")
+            mode_label = "multi-instance" if _multi_instance_mode else "single-instance"
+            print(f"MCP Server available at http://{mcp.settings.host}:{mcp.settings.port}/sse ({mode_label} mode)")
             mcp.settings.log_level = "INFO"
             mcp.run(transport="sse")
     except KeyboardInterrupt:

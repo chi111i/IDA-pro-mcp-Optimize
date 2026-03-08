@@ -9,6 +9,7 @@ import struct
 import threading
 import http.server
 import uuid
+from collections import OrderedDict
 from urllib.parse import urlparse
 from typing import (
     Any,
@@ -181,16 +182,53 @@ def unsafe(func: Callable) -> Callable:
     """Decorator to register mark a function as unsafe"""
     return rpc_registry.mark_unsafe(func)
 
+# --- Extension groups (hidden by default, enabled via --ext=group) ---
+MCP_EXTENSIONS: dict[str, set[str]] = {}
+
+def ext(group: str):
+    """Mark a tool as belonging to an extension group.
+
+    Tools in extension groups are hidden by default and require explicit
+    opt-in via --ext=group command line flag. Example usage:
+
+        @ext("dbg")
+        @jsonrpc
+        @idasync
+        def my_debug_tool(...):
+            ...
+    """
+    def decorator(func: Callable) -> Callable:
+        if group not in MCP_EXTENSIONS:
+            MCP_EXTENSIONS[group] = set()
+        MCP_EXTENSIONS[group].add(func.__name__)
+        return func
+    return decorator
+
 # --- Output Truncation System ---
 OUTPUT_LIMIT_BYTES = 50 * 1024  # 50KB
 OUTPUT_LIMIT_PREVIEW_ITEMS = 10
 OUTPUT_LIMIT_PREVIEW_STR_LEN = 1000
 OUTPUT_CACHE_MAX_SIZE = 100
-_output_cache: dict[str, str] = {}  # output_id -> json string
+_OUTPUT_CACHE_TTL_SEC = 1800  # 30 minutes
+MAX_REQUEST_SIZE = 10 * 1024 * 1024  # 10MB - maximum allowed JSON-RPC request body
+import time as _time_mod  # aliased to avoid conflict with stdlib 'time'
+_output_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()  # output_id -> (monotonic_ts, json_str)
+_output_cache_lock = threading.Lock()  # Thread-safe access to _output_cache
+
+# Keys to always preserve during truncation (schema-critical fields)
+_PRESERVE_KEYS = frozenset({
+    "name", "type", "address", "start_address", "end_address",
+    "size", "offset", "module", "arch", "base",
+    "error", "message", "code",
+})
 
 
 def _truncate_value(value: Any, depth: int = 0) -> Any:
-    """Create a preview version of a large result by truncating nested content."""
+    """Create a preview version of a large result by truncating nested content.
+
+    Preserves schema-critical keys (addresses, names, types) even in
+    deeply nested structures, so the preview remains structurally useful.
+    """
     if depth > 5:
         return value
     if isinstance(value, str) and len(value) > OUTPUT_LIMIT_PREVIEW_STR_LEN:
@@ -201,7 +239,14 @@ def _truncate_value(value: Any, depth: int = 0) -> Any:
             truncated.append({"_truncated": f"... and {len(value) - OUTPUT_LIMIT_PREVIEW_ITEMS} more items"})
         return truncated
     if isinstance(value, dict):
-        return {k: _truncate_value(v, depth + 1) for k, v in value.items()}
+        result = {}
+        for k, v in value.items():
+            if k in _PRESERVE_KEYS:
+                # Preserve critical keys without deep truncation
+                result[k] = v if depth < 3 else _truncate_value(v, depth + 1)
+            else:
+                result[k] = _truncate_value(v, depth + 1)
+        return result
     return value
 
 
@@ -215,12 +260,21 @@ def _cache_and_truncate(result: Any, base_url: str) -> Any:
     if len(serialized) <= OUTPUT_LIMIT_BYTES:
         return result
 
-    # Cache full output
+    # Cache full output (thread-safe)
     output_id = str(uuid.uuid4())
-    if len(_output_cache) >= OUTPUT_CACHE_MAX_SIZE:
-        oldest_key = next(iter(_output_cache))
-        del _output_cache[oldest_key]
-    _output_cache[output_id] = serialized
+    now = _time_mod.monotonic()
+    with _output_cache_lock:
+        # Evict expired entries first
+        expired_keys = [
+            k for k, (ts, _) in _output_cache.items()
+            if now - ts > _OUTPUT_CACHE_TTL_SEC
+        ]
+        for k in expired_keys:
+            del _output_cache[k]
+        # Then enforce max size via LRU
+        if len(_output_cache) >= OUTPUT_CACHE_MAX_SIZE:
+            _output_cache.popitem(last=False)  # Evict oldest (LRU)
+        _output_cache[output_id] = (now, serialized)
 
     # Create truncated preview
     preview = _truncate_value(result)
@@ -265,7 +319,17 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
         # Match /output/<uuid>.json
         if path.startswith("/output/") and path.endswith(".json"):
             output_id = path[len("/output/"):-len(".json")]
-            cached = _output_cache.get(output_id)
+            cached = None
+            with _output_cache_lock:
+                entry = _output_cache.get(output_id)
+                if entry is not None:
+                    ts, data = entry
+                    if _time_mod.monotonic() - ts > _OUTPUT_CACHE_TTL_SEC:
+                        # Expired — remove from cache
+                        del _output_cache[output_id]
+                    else:
+                        _output_cache.move_to_end(output_id)  # LRU touch
+                        cached = data
             if cached is not None:
                 response_body = cached.encode("utf-8")
                 self.send_response(200)
@@ -292,6 +356,13 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:
             self.send_jsonrpc_error(-32700, "Parse error: missing request body", None)
+            return
+        if content_length < 0 or content_length > MAX_REQUEST_SIZE:
+            self.send_jsonrpc_error(
+                -32600,
+                f"Request body too large ({content_length} bytes, max {MAX_REQUEST_SIZE})",
+                None,
+            )
             return
 
         request_body = self.rfile.read(content_length)
@@ -321,7 +392,9 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
             result = rpc_registry.dispatch(request["method"], request.get("params", []))
 
             # Apply output truncation for large results
-            base_url = f"http://{Server.HOST}:{Server.PORT}"
+            # self.server is MCPHTTPServer; server_address[1] is the actual bound port
+            actual_port = self.server.server_address[1]
+            base_url = f"http://{Server.HOST}:{actual_port}"
             result = _cache_and_truncate(result, base_url)
             response["result"] = result
 
@@ -367,23 +440,49 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
         # Suppress logging
         pass
 
-class MCPHTTPServer(http.server.HTTPServer):
-    allow_reuse_address = False
+import socketserver
+
+class MCPHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    allow_reuse_address = True  # Allow quick restart after crash/TIME_WAIT
+    daemon_threads = True  # Auto-cleanup threads on server shutdown
+
+# ---------------------------------------------------------------------------
+# Multi-instance registry support (optional, graceful degradation)
+# ---------------------------------------------------------------------------
+try:
+    from ida_pro_mcp.registry import InstanceRegistry, get_default_registry_path
+    from ida_pro_mcp.instance_id import generate_instance_id
+    _HAS_REGISTRY = True
+except ImportError:
+    _HAS_REGISTRY = False
+
 
 class Server:
     HOST = "127.0.0.1"
-    PORT = 13337
+    # Default port: 0 = OS auto-assign.  Set IDA_MCP_PORT to override.
+    PORT = int(os.environ.get("IDA_MCP_PORT", "0"))
 
     def __init__(self):
-        self.server = None
-        self.server_thread = None
+        self.server: MCPHTTPServer | None = None
+        self.server_thread: threading.Thread | None = None
         self.running = False
+        self.actual_port: int | None = None
+        # Multi-instance support
+        self.instance_id: str | None = None
+        self._registry: InstanceRegistry | None = None
+        self._heartbeat_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    def get_port(self) -> int | None:
+        """Return the actual port the server is bound to."""
+        return self.actual_port
 
     def start(self):
         if self.running:
             print("[MCP] Server is already running")
             return
 
+        self._stop_event.clear()
         self.server_thread = threading.Thread(target=self._run_server, daemon=True)
         self.running = True
         self.server_thread.start()
@@ -393,23 +492,43 @@ class Server:
             return
 
         self.running = False
+        self._stop_event.set()
+
+        # Unregister from registry before stopping the server
+        self._unregister()
+
+        # Stop heartbeat thread
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=2.0)
+            self._heartbeat_thread = None
+
         if self.server:
             self.server.shutdown()
             self.server.server_close()
         if self.server_thread:
             self.server_thread.join()
             self.server = None
+
+        self.actual_port = None
         print("[MCP] Server stopped")
 
     def _run_server(self):
         try:
-            # Create server in the thread to handle binding
             self.server = MCPHTTPServer((Server.HOST, Server.PORT), JSONRPCRequestHandler)
-            print(f"[MCP] Server started at http://{Server.HOST}:{Server.PORT}")
+            self.actual_port = self.server.server_address[1]
+            print(f"[MCP] Server started at http://{Server.HOST}:{self.actual_port}")
+
+            # Register with multi-instance registry
+            self._register()
+
+            # Start heartbeat thread
+            self._start_heartbeat()
+
             self.server.serve_forever()
         except OSError as e:
             if e.errno == 98 or e.errno == 10048:  # Port already in use (Linux/Windows)
-                print("[MCP] Error: Port 13337 is already in use")
+                port_display = Server.PORT if Server.PORT != 0 else "auto"
+                print(f"[MCP] Error: Port {port_display} is already in use")
             else:
                 print(f"[MCP] Server error: {e}")
             self.running = False
@@ -417,6 +536,91 @@ class Server:
             print(f"[MCP] Server error: {e}")
         finally:
             self.running = False
+
+    # --- Multi-instance registry integration ---
+
+    def _register(self) -> None:
+        """Register this IDA instance in the file-based registry."""
+        if not _HAS_REGISTRY or self.actual_port is None:
+            return
+        try:
+            self._registry = InstanceRegistry()
+            pid = os.getpid()
+            port = self.actual_port
+
+            # Gather IDA metadata (compatible with IDA 8.x and 9.x)
+            idb_path = ""
+            binary_name = "unknown"
+            binary_path = ""
+            arch = "unknown"
+            try:
+                import idc
+                import idaapi as _idaapi
+                idb_path = _idaapi.get_input_file_path()
+                binary_name = _idaapi.get_root_filename()
+                binary_path = _idaapi.get_input_file_path()
+                # Architecture detection (IDA 9.x vs 8.x)
+                try:
+                    import ida_ida
+                    bits = "64" if ida_ida.inf_is_64bit() else "32"
+                    proc = ida_ida.inf_get_procname()
+                    arch = f"{proc}{bits}"
+                except (ImportError, AttributeError):
+                    try:
+                        info = _idaapi.get_inf_structure()
+                        bits = "64" if info.is_64bit() else "32"
+                        proc = info.procname
+                        arch = f"{proc}{bits}"
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            self.instance_id = self._registry.register(
+                pid=pid,
+                port=port,
+                idb_path=idb_path,
+                binary_name=binary_name,
+                binary_path=binary_path,
+                arch=arch,
+                host=Server.HOST,
+            )
+            print(f"[MCP] Registered as instance '{self.instance_id}' "
+                  f"(port {port}, {binary_name})")
+        except Exception as e:
+            print(f"[MCP] Registry registration failed (non-fatal): {e}")
+            self._registry = None
+
+    def _unregister(self) -> None:
+        """Unregister this IDA instance from the registry."""
+        if self._registry is None or self.instance_id is None:
+            return
+        try:
+            self._registry.unregister(self.instance_id)
+            print(f"[MCP] Unregistered instance '{self.instance_id}'")
+        except Exception as e:
+            print(f"[MCP] Registry unregistration failed (non-fatal): {e}")
+        finally:
+            self.instance_id = None
+
+    def _start_heartbeat(self) -> None:
+        """Start the heartbeat thread for registry keepalive."""
+        if self._registry is None or self.instance_id is None:
+            return
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        """Periodically update heartbeat timestamp in registry."""
+        while not self._stop_event.is_set():
+            try:
+                if self.instance_id and self._registry:
+                    self._registry.update_heartbeat(self.instance_id)
+            except Exception as e:
+                print(f"[MCP] Heartbeat error (non-fatal): {e}")
+            self._stop_event.wait(timeout=60.0)
 
 # A module that helps with writing thread safe ida code.
 # Based on:
@@ -482,6 +686,24 @@ class IDASyncError(Exception):
 
 logger = logging.getLogger(__name__)
 
+# --- Tool execution timeout configuration ---
+import time as _time
+
+_TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
+_DEFAULT_TOOL_TIMEOUT_SEC = 15.0
+
+
+def _get_tool_timeout_seconds() -> float:
+    """Read tool timeout from environment variable (default 15s, 0 = disabled)."""
+    value = os.environ.get(_TOOL_TIMEOUT_ENV, "").strip()
+    if not value:
+        return _DEFAULT_TOOL_TIMEOUT_SEC
+    try:
+        return float(value)
+    except ValueError:
+        return _DEFAULT_TOOL_TIMEOUT_SEC
+
+
 # Enum for safety modes. Higher means safer:
 class IDASafety(IntEnum):
     SAFE_NONE = ida_kernwin.MFF_FAST
@@ -490,40 +712,67 @@ class IDASafety(IntEnum):
 
 call_stack = queue.LifoQueue()
 
-def sync_wrapper(ff, safety_mode: IDASafety):
+
+def sync_wrapper(ff, safety_mode: IDASafety, timeout_override: float | None = None):
+    """Call a function ff with a specific IDA safety_mode.
+
+    Features:
+    - Batch mode: ``idc.batch(1)`` suppresses IDA dialogs during execution
+    - Timeout: ``sys.setprofile()`` checks deadline on every Python call/return
+    - Configurable via ``IDA_MCP_TOOL_TIMEOUT_SEC`` env var or ``timeout_override``
     """
-    Call a function ff with a specific IDA safety_mode.
-    """
-    #logger.debug('sync_wrapper: {}, {}'.format(ff.__name__, safety_mode))
 
     if safety_mode not in [IDASafety.SAFE_READ, IDASafety.SAFE_WRITE]:
-        error_str = 'Invalid safety mode {} over function {}'\
-                .format(safety_mode, ff.__name__)
+        error_str = f'Invalid safety mode {safety_mode} over function {ff.__name__}'
         logger.error(error_str)
         raise IDASyncError(error_str)
 
-    # No safety level is set up:
+    # Determine effective timeout
+    timeout = timeout_override if timeout_override is not None else _get_tool_timeout_seconds()
+
     res_container = queue.Queue()
 
     def runned():
-        #logger.debug('Inside runned')
-
-        # Make sure that we are not already inside a sync_wrapper:
+        # Make sure that we are not already inside a sync_wrapper (peek, not pop):
         if not call_stack.empty():
-            last_func_name = call_stack.get()
-            error_str = ('Call stack is not empty while calling the '
-                'function {} from {}').format(ff.__name__, last_func_name)
-            #logger.error(error_str)
+            try:
+                last_func_name = call_stack.queue[-1]  # peek without removing
+            except IndexError:
+                last_func_name = "<unknown>"
+            error_str = (
+                f'Call stack is not empty while calling '
+                f'{ff.__name__} from {last_func_name}'
+            )
             raise IDASyncError(error_str)
 
-        call_stack.put((ff.__name__))
+        call_stack.put(ff.__name__)
+        # Enable batch mode to suppress IDA dialogs during MCP operations
+        old_batch = idc.batch(1)
         try:
-            res_container.put(ff())
+            if timeout > 0:
+                # Inject timeout via sys.setprofile — checks on every call/return
+                deadline = _time.monotonic() + timeout
+
+                def _timeout_profile(frame, event, arg):
+                    if _time.monotonic() >= deadline:
+                        raise IDASyncError(
+                            f"Tool '{ff.__name__}' timed out after {timeout:.1f}s "
+                            f"(configure via {_TOOL_TIMEOUT_ENV} env var)"
+                        )
+
+                old_profile = sys.getprofile()
+                sys.setprofile(_timeout_profile)
+                try:
+                    res_container.put(ff())
+                finally:
+                    sys.setprofile(old_profile)
+            else:
+                res_container.put(ff())
         except Exception as x:
             res_container.put(x)
         finally:
+            idc.batch(old_batch)
             call_stack.get()
-            #logger.debug('Finished runned')
 
     ret_val = idaapi.execute_sync(runned, safety_mode)
     res = res_container.get()
@@ -532,46 +781,99 @@ def sync_wrapper(ff, safety_mode: IDASafety):
     return res
 
 def idawrite(f):
-    """
-    decorator for marking a function as modifying the IDB.
-    schedules a request to be made in the main IDA loop to avoid IDB corruption.
+    """Decorator for marking a function as modifying the IDB.
+
+    Schedules a request to be made in the main IDA loop to avoid IDB corruption.
+    Supports per-tool timeout via @tool_timeout decorator.
     """
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         ff = functools.partial(f, *args, **kwargs)
-        ff.__name__ = f.__name__ # type: ignore
-        return sync_wrapper(ff, idaapi.MFF_WRITE)
+        ff.__name__ = f.__name__  # type: ignore
+        timeout_override = getattr(f, "__ida_mcp_timeout_sec__", None)
+        if timeout_override is not None:
+            timeout_override = float(timeout_override)
+        return sync_wrapper(ff, idaapi.MFF_WRITE, timeout_override=timeout_override)
     return wrapper
+
 
 def idaread(f):
-    """
-    decorator for marking a function as reading from the IDB.
-    schedules a request to be made in the main IDA loop to avoid
-      inconsistent results.
-    MFF_READ constant via: http://www.openrce.org/forums/posts/1827
+    """Legacy decorator for marking a function as reading from the IDB.
+
+    Now uses MFF_WRITE for safety (same as @idasync), since IDA's "read"
+    operations may internally require write access (e.g. decompilation).
+    Kept for backward compatibility with existing @jsonrpc handlers.
+    Supports per-tool timeout via @tool_timeout decorator.
     """
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         ff = functools.partial(f, *args, **kwargs)
-        ff.__name__ = f.__name__ # type: ignore
-        return sync_wrapper(ff, idaapi.MFF_READ)
+        ff.__name__ = f.__name__  # type: ignore
+        timeout_override = getattr(f, "__ida_mcp_timeout_sec__", None)
+        if timeout_override is not None:
+            timeout_override = float(timeout_override)
+        return sync_wrapper(ff, idaapi.MFF_WRITE, timeout_override=timeout_override)
     return wrapper
 
+
+def idasync(f):
+    """Unified decorator for safely calling any IDA function from a non-main thread.
+
+    Always uses MFF_WRITE mode for maximum safety — IDA's "read" operations
+    (like decompilation) may internally require write access.
+
+    Recommended for all new @jsonrpc handlers. Existing @idaread/@idawrite
+    decorators are kept for backward compatibility.
+    Supports per-tool timeout via @tool_timeout decorator.
+    """
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        ff = functools.partial(f, *args, **kwargs)
+        ff.__name__ = f.__name__  # type: ignore
+        timeout_override = getattr(f, "__ida_mcp_timeout_sec__", None)
+        if timeout_override is not None:
+            timeout_override = float(timeout_override)
+        return sync_wrapper(ff, idaapi.MFF_WRITE, timeout_override=timeout_override)
+    return wrapper
+
+
+def tool_timeout(seconds: float):
+    """Decorator to override per-tool timeout (seconds).
+
+    Must be applied BEFORE @idasync/@idaread/@idawrite (listed AFTER in
+    decorator stack) so the attribute exists when the sync decorator
+    captures the function:
+
+        @jsonrpc
+        @idasync
+        @tool_timeout(90.0)  # innermost — sets attribute on raw function
+        def my_long_running_func(...):
+            ...
+    """
+    def decorator(func):
+        setattr(func, "__ida_mcp_timeout_sec__", seconds)
+        return func
+    return decorator
+
 def is_window_active():
-    """Returns whether IDA is currently active"""
+    """Returns whether IDA is currently active.
+
+    Supports both PyQt5 (IDA < 9.2) and PySide6 (IDA >= 9.2).
+    """
     try:
-        from PyQt5.QtWidgets import QApplication
+        # IDA 9.2+ switched from PyQt5 to PySide6
+        using_pyside6 = (ida_major > 9) or (ida_major == 9 and ida_minor >= 2)
+        if using_pyside6:
+            from PySide6 import QtWidgets
+        else:
+            from PyQt5 import QtWidgets
+
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return False
+        return app.activeWindow() is not None
     except ImportError:
         return False
-
-    app = QApplication.instance()
-    if app is None:
-        return False
-
-    for widget in app.topLevelWidgets():
-        if widget.isActiveWindow():
-            return True
-    return False
 
 class Metadata(TypedDict):
     path: str
@@ -3327,6 +3629,8 @@ class MCP(idaapi.plugin_t):
 
     def init(self):
         self.server = Server()
+        self._idb_hooks = None
+        self._ui_hooks = None
         hotkey = MCP.wanted_hotkey.replace("-", "+")
         if sys.platform == "darwin":
             hotkey = hotkey.replace("Alt", "Option")
@@ -3335,9 +3639,55 @@ class MCP(idaapi.plugin_t):
 
     def run(self, arg):
         self.server.start()
+        self._install_hooks()
 
     def term(self):
+        self._uninstall_hooks()
         self.server.stop()
+
+    def _install_hooks(self):
+        """Install IDB/UI hooks for automatic re-registration on database changes."""
+        if self._idb_hooks is not None:
+            return
+        try:
+            server_ref = self.server
+
+            class MCPIDBHooks(idaapi.IDB_Hooks):
+                def closebase(self):
+                    """Database closing: stop server and unregister."""
+                    try:
+                        server_ref.stop()
+                    except Exception as e:
+                        print(f"[MCP] Error stopping server on closebase: {e}")
+                    return 0
+
+            class MCPUIHooks(idaapi.UI_Hooks):
+                def database_inited(self, is_new_database, idc_script):
+                    """New database opened: restart server and re-register."""
+                    try:
+                        if not server_ref.running:
+                            server_ref.start()
+                    except Exception as e:
+                        print(f"[MCP] Error starting server on database_inited: {e}")
+
+            self._idb_hooks = MCPIDBHooks()
+            self._idb_hooks.hook()
+            self._ui_hooks = MCPUIHooks()
+            self._ui_hooks.hook()
+        except Exception as e:
+            print(f"[MCP] Failed to install hooks (non-fatal): {e}")
+
+    def _uninstall_hooks(self):
+        """Remove IDB/UI hooks."""
+        try:
+            if self._idb_hooks is not None:
+                self._idb_hooks.unhook()
+                self._idb_hooks = None
+            if self._ui_hooks is not None:
+                self._ui_hooks.unhook()
+                self._ui_hooks = None
+        except Exception:
+            pass
 
 def PLUGIN_ENTRY():
     return MCP()
